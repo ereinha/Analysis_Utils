@@ -1,10 +1,9 @@
 import h5py
 import ROOT
 import numpy as np
-import glob, os
-from numpy.lib.stride_tricks import as_strided
 
 import argparse
+
 parser = argparse.ArgumentParser(description='Process some integers.')
 parser.add_argument('-i', '--infile', default='output_qqgg.root', type=str, help='Input root file.')
 parser.add_argument('-o', '--outdir', default='.', type=str, help='Output pq file dir.')
@@ -15,34 +14,48 @@ parser.add_argument('-m', '--mass', default='', type=str, help='signal mass')
 args = parser.parse_args()
 chunk_size = args.chunk_size
 
-def upsample_array(x, b0, b1):
-    r, c = x.shape                                    # number of rows/columns
-    rs, cs = x.strides                                # row/column strides
-    x = as_strided(x, (r, b0, c, b1), (rs, 0, cs, 0)) # view as a larger 4D array
+def compress_channel(values: np.ndarray,
+                     coords:  np.ndarray,
+                     k: int = 1500,
+                     thresh: float = 1e-4):
+    mask         = values > thresh
+    if not mask.any():
+        # no hits above threshold
+        return np.full((k, 3), -np.inf, dtype=np.float32), False
 
-    return x.reshape(r*b0, c*b1)/(b0*b1)              # create new 2D array with same total occupancy
+    vals   = values[mask]
+    coord  = coords[mask]
 
-def crop_jet(imgECAL, iphi, ieta, jet_shape=125):
-    # NOTE: jet_shape here should correspond to the one used in RHAnalyzer
-    off = jet_shape//2
-    iphi = int(iphi*5 + 2) # 5 EB xtals per HB tower
-    ieta = int(ieta*5 + 2) # 5 EB xtals per HB tower
-
-    # Wrap-around on left side
-    if iphi < off:
-        diff = off-iphi
-        img_crop = np.concatenate((imgECAL[:,ieta-off:ieta+off+1,-diff:],
-                                   imgECAL[:,ieta-off:ieta+off+1,:iphi+off+1]), axis=-1)
-    # Wrap-around on right side
-    elif 360-iphi < off:
-        diff = off - (360-iphi)
-        img_crop = np.concatenate((imgECAL[:,ieta-off:ieta+off+1,iphi-off:],
-                                   imgECAL[:,ieta-off:ieta+off+1,:diff+1]), axis=-1)
-    # Nominal case
+    # if too many hits, pick top k hits and remember the overflow
+    if vals.shape[0] > k:
+        top_idx = np.argpartition(-vals, k - 1)[:k]   # O(N)
+        vals, coord = vals[top_idx], coord[top_idx]
+        overflow = True
     else:
-        img_crop = imgECAL[:,ieta-off:ieta+off+1,iphi-off:iphi+off+1]
+        overflow = False
+        pad = k - vals.shape[0]
+        # pad with -inf
+        vals   = np.concatenate([vals,   np.full(pad, -np.inf, dtype=np.float32)])
+        coord  = np.concatenate([coord,  np.full((pad, 2), -np.inf, dtype=np.float32)])
 
-    return img_crop
+    hits = np.column_stack([vals, coord])   # (k, 3)
+    return hits.astype(np.float32), overflow
+
+overflow_counter = np.zeros(11, dtype=np.int64)
+
+ECAL_eta = np.linspace(-3, 3, 56).reshape(56, 1)
+ECAL_phi = np.linspace(-np.pi, np.pi, 72).reshape(1, 72)
+ECAL_etaphi = np.ones((56, 72, 2))
+ECAL_etaphi[:, :, 0] *= ECAL_eta
+ECAL_etaphi[:, :, 1] *= ECAL_phi
+ECAL_etaphi = ECAL_etaphi.reshape(56*72,2)
+
+HCAL_eta = np.linspace(-3, 3, 280).reshape(280,1)
+HCAL_phi = np.linspace(-np.pi, np.pi, 360).reshape(1, 360)
+HCAL_etaphi = np.ones((280, 360, 2))
+HCAL_etaphi[:, :, 0] *= HCAL_eta
+HCAL_etaphi[:, :, 1] *= HCAL_phi
+HCAL_etaphi = HCAL_etaphi.reshape(280*360,2)
 
 rhTreeStr = args.infile
 rhTree = ROOT.TChain("fevt/RHTree")
@@ -63,15 +76,20 @@ print(" >> Processing entries: [",iEvtStart,"->",iEvtEnd,")")
 sw = ROOT.TStopwatch()
 sw.Start()
 with h5py.File(f'{outStr}', 'w') as proper_data:
-        dataset_names = ['all_jet', 'am', 'ieta', 'iphi', 'apt', 'a_eta', 'a_phi','jet_mass', 'jet_pt', 'jet_e', 'TaudR', 'nVtx']
+        dataset_names = ['A_diphoton_gen_m0', 'A_diphoton_gen_dR', 'A_diphoton_gen_E', 
+                         'A_diphoton_gen_pT', 'A_diphoton_gen_eta', 'A_diphoton_gen_phi',
+                         'A_diphoton_reco_M', 'A_diphoton_reco_dR', 'A_diphoton_reco_E',
+                         'A_diphoton_reco_pT', 'A_diphoton_reco_eta', 'A_diphoton_reco_phi',
+                         'A_ditau_gen_m0', 'A_ditau_gen_dR', 'A_ditau_gen_E',
+                         'A_ditau_gen_pT', 'A_ditau_gen_eta', 'A_ditau_gen_phi']
         datasets = {
             name: proper_data.create_dataset(
                 name,
-                shape= (0, 13, 125, 125) if 'all_jet' in name else (0,1),
-                maxshape=(None, 13, 125, 125) if 'all_jet' in name else (None, 1),
+                shape= (0, 1500, 11, 3) if 'zero_suppressed_hit_collection' in name else (0,1),
+                maxshape=(None, 1500, 11, 3) if 'zero_suppressed_hit_collection' in name else (None, 1),
                 dtype='float32',  # Specify an appropriate data type
                 compression='lzf',
-                chunks=(chunk_size, 13, 125, 125) if 'all_jet' in name else (chunk_size, 1),
+                chunks=(chunk_size, 1500, 11, 3) if 'zero_suppressed_hit_collection' in name else (chunk_size, 1),
             ) for name in dataset_names
         }
         end_idx = 0
@@ -84,61 +102,103 @@ with h5py.File(f'{outStr}', 'w') as proper_data:
                 print(" .. Processing entry",iEvt)
 
             # Jet attributes
-            ams    = rhTree.a_m
-            apts   = rhTree.a_pt
-            aetas   = rhTree.a_eta
-            aphis   = rhTree.a_phi
-            jet_mass = rhTree.jetM
-            jet_Pt = rhTree.jetPt
-            jet_E = rhTree.jetE
-            iphis  = rhTree.jetSeed_iphi
-            ietas  = rhTree.jetSeed_ieta
-            taudrs = rhTree.TaudR
-            nVtx  = rhTree.nVtx
-            ys  = min(len(ietas), len(iphis))
+            A_diphoton_gen_m0       = rhTree.A_diphoton_gen_m0
+            A_diphoton_gen_dR       = rhTree.A_diphoton_gen_dR
+            A_diphoton_gen_E        = rhTree.A_diphoton_gen_E
+            A_diphoton_gen_pT       = rhTree.A_diphoton_gen_pT
+            A_diphoton_gen_eta      = rhTree.A_diphoton_gen_eta
+            A_diphoton_gen_phi      = rhTree.A_diphoton_gen_phi
+            A_diphoton_reco_M       = rhTree.A_diphoton_reco_M
+            A_diphoton_reco_dR      = rhTree.A_diphoton_reco_dR
+            A_diphoton_reco_E       = rhTree.A_diphoton_reco_E
+            A_diphoton_reco_pT      = rhTree.A_diphoton_reco_pT
+            A_diphoton_reco_eta     = rhTree.A_diphoton_reco_eta
+            A_diphoton_reco_phi     = rhTree.A_diphoton_reco_phi
+
+            A_ditau_gen_m0          = rhTree.A_ditau_gen_m0
+            A_ditau_gen_dR          = rhTree.A_ditau_gen_dR
+            A_ditau_gen_E           = rhTree.A_ditau_gen_E
+            A_ditau_gen_pT          = rhTree.A_ditau_gen_pT
+            A_ditau_gen_eta         = rhTree.A_ditau_gen_eta
+            A_ditau_gen_phi         = rhTree.A_ditau_gen_phi
+
+            ys  = len(A_diphoton_gen_m0)
             if ys < 2: continue
             end_idx = end_idx + ys
 
 
 
-            ECAL_energy = np.array(rhTree.ECAL_energy).reshape(280,360)
-            HBHE_energy = np.array(rhTree.HBHE_energy).reshape(56,72)
-            HBHE_energy = upsample_array(HBHE_energy, 5, 5) # (280, 360)
-            TracksAtECAL_pt    = np.array(rhTree.ECAL_tracksPt_atECALfixIP).reshape(280,360)
-            TracksAtECAL_dZSig = np.array(rhTree.ECAL_tracksDzSig_atECALfixIP).reshape(280,360)
-            TracksAtECAL_d0Sig = np.array(rhTree.ECAL_tracksD0Sig_atECALfixIP).reshape(280,360)
-            PixAtEcal_1        = np.array(rhTree.BPIX_layer1_ECAL_atPV).reshape(280,360)
-            PixAtEcal_2        = np.array(rhTree.BPIX_layer2_ECAL_atPV).reshape(280,360)
-            PixAtEcal_3        = np.array(rhTree.BPIX_layer3_ECAL_atPV).reshape(280,360)
-            PixAtEcal_4        = np.array(rhTree.BPIX_layer4_ECAL_atPV).reshape(280,360)
-            TibAtEcal_1        = np.array(rhTree.TIB_layer1_ECAL_atPV).reshape(280,360)
-            TibAtEcal_2        = np.array(rhTree.TIB_layer2_ECAL_atPV).reshape(280,360)
-            TobAtEcal_1        = np.array(rhTree.TOB_layer1_ECAL_atPV).reshape(280,360)
-            TobAtEcal_2        = np.array(rhTree.TOB_layer2_ECAL_atPV).reshape(280,360)
-            X_CMSII            = np.stack([TracksAtECAL_pt, TracksAtECAL_dZSig, TracksAtECAL_d0Sig, ECAL_energy, HBHE_energy, PixAtEcal_1, PixAtEcal_2, PixAtEcal_3, PixAtEcal_4, TibAtEcal_1, TibAtEcal_2, TobAtEcal_1, TobAtEcal_2], axis=0) # (13, 280, 360)
-
-
-
+            HBHE_energy        = np.array(rhTree.HBHE_energy).reshape(56*72)
+            ECAL_energy        = np.array(rhTree.ECAL_energy).reshape(280*360)
+            TracksAtECAL_pt    = np.array(rhTree.ECAL_tracksPt_atECALfixIP).reshape(280*360)
+            PixAtEcal_1        = np.array(rhTree.BPIX_layer1_ECAL_atPV).reshape(280*360)
+            PixAtEcal_2        = np.array(rhTree.BPIX_layer2_ECAL_atPV).reshape(280*360)
+            PixAtEcal_3        = np.array(rhTree.BPIX_layer3_ECAL_atPV).reshape(280*360)
+            PixAtEcal_4        = np.array(rhTree.BPIX_layer4_ECAL_atPV).reshape(280*360)
+            TibAtEcal_1        = np.array(rhTree.TIB_layer1_ECAL_atPV).reshape(280*360)
+            TibAtEcal_2        = np.array(rhTree.TIB_layer2_ECAL_atPV).reshape(280*360)
+            TobAtEcal_1        = np.array(rhTree.TOB_layer1_ECAL_atPV).reshape(280*360)
+            TobAtEcal_2        = np.array(rhTree.TOB_layer2_ECAL_atPV).reshape(280*360)
+            HighResCollection            = np.stack([TracksAtECAL_pt, ECAL_energy, PixAtEcal_1, 
+                                                     PixAtEcal_2, PixAtEcal_3, PixAtEcal_4, 
+                                                     TibAtEcal_1, TibAtEcal_2, TobAtEcal_1, 
+                                                     TobAtEcal_2], axis=1)
 
             for name, dataset in datasets.items():
-                dataset.resize((end_idx,13, 125, 125) if 'all_jet' in name else (end_idx,1))
+                dataset.resize((end_idx, 1500, 11, 3) if 'zero_suppressed_hit_collection' in name else (end_idx,1))
+
+            # build hit matrix once per event (will be reused for each jet i)
+            hit_matrix = np.full((1500, 11, 3), -np.inf, dtype=np.float32)
+
+            # 10 high-res channels (use HCAL grid for coords)
+            for ch in range(10):
+                hit_slice, over = compress_channel(
+                    HighResCollection[:, ch],
+                    HCAL_etaphi, 1500, 1e-4)
+                hit_matrix[:, ch, :] = hit_slice
+                if over:
+                    overflow_counter[ch] += 1
+
+            # HBHE channel (use ECAL grid for coords)
+            hit_slice, over = compress_channel(
+                HBHE_energy,
+                ECAL_etaphi, 1500, 1e-4)
+            hit_matrix[:, 10, :] = hit_slice
+            if over:
+                overflow_counter[10] += 1
 
             for i in range(ys):
-                proper_data['all_jet'][end_idx - ys + i, :, :, :] = crop_jet(X_CMSII, iphis[i], ietas[i], jet_shape=125)
+                proper_data['zero_suppressed_hit_collection'][end_idx - ys + i, :, :, :] = hit_matrix
 
-                proper_data['am'][end_idx - ys + i, :] = ams[i]
-                proper_data['ieta'][end_idx - ys + i, :] = ietas[i]
-                proper_data['iphi'][end_idx - ys + i, :] = iphis[i]
-                proper_data['apt'][end_idx - ys + i, :] = apts[i]
-                proper_data['a_eta'][end_idx - ys + i, :] = aetas[i]
-                proper_data['a_phi'][end_idx - ys + i, :] = aphis[i]
-                proper_data['jet_mass'][end_idx - ys + i, :] = jet_mass[i]
-                proper_data['jet_pt'][end_idx - ys + i, :] = jet_Pt[i]
-                proper_data['jet_e'][end_idx - ys + i, :] = jet_E[i]
-                proper_data['TaudR'][end_idx - ys + i, :] = taudrs[i]
-                proper_data['nVtx'][end_idx - ys + i, :] = nVtx
+                proper_data['A_diphoton_gen_m0'][end_idx - ys + i, :]   = A_diphoton_gen_m0[i]
+                proper_data['A_diphoton_gen_dR'][end_idx - ys + i, :]   = A_diphoton_gen_dR[i]
+                proper_data['A_diphoton_gen_E'][end_idx - ys + i, :]    = A_diphoton_gen_E[i]
+                proper_data['A_diphoton_gen_pT'][end_idx - ys + i, :]   = A_diphoton_gen_pT[i]
+                proper_data['A_diphoton_gen_eta'][end_idx - ys + i, :]  = A_diphoton_gen_eta[i]
+                proper_data['A_diphoton_gen_phi'][end_idx - ys + i, :]  = A_diphoton_gen_phi[i]
+                proper_data['A_diphoton_reco_M'][end_idx - ys + i, :]   = A_diphoton_reco_M[i]
+                proper_data['A_diphoton_reco_dR'][end_idx - ys + i, :]  = A_diphoton_reco_dR[i]
+                proper_data['A_diphoton_reco_E'][end_idx - ys + i, :]   = A_diphoton_reco_E[i]
+                proper_data['A_diphoton_reco_pT'][end_idx - ys + i, :]  = A_diphoton_reco_pT[i]
+                proper_data['A_diphoton_reco_eta'][end_idx - ys + i, :] = A_diphoton_reco_eta[i]
+                proper_data['A_diphoton_reco_phi'][end_idx - ys + i, :] = A_diphoton_reco_phi[i]
 
+                proper_data['A_ditau_gen_m0'][end_idx - ys + i, :]      = A_ditau_gen_m0[i]
+                proper_data['A_ditau_gen_dR'][end_idx - ys + i, :]      = A_ditau_gen_dR[i]
+                proper_data['A_ditau_gen_E'][end_idx - ys + i, :]       = A_ditau_gen_E[i]
+                proper_data['A_ditau_gen_pT'][end_idx - ys + i, :]      = A_ditau_gen_pT[i]
+                proper_data['A_ditau_gen_eta'][end_idx - ys + i, :]     = A_ditau_gen_eta[i]
+                proper_data['A_ditau_gen_phi'][end_idx - ys + i, :]     = A_ditau_gen_phi[i]
 
-print(" >> Real time:",sw.RealTime()/60.,"minutes")
-print(" >> CPU time: ",sw.CpuTime() /60.,"minutes")
+print(" >> Real time:", sw.RealTime() / 60., "minutes")
+print(" >> CPU time: ", sw.CpuTime() / 60., "minutes")
 print("========================================================")
+print("\n=== Overflow summary (events that had >1500 non-zero hits) ===")
+channel_names = [
+    'TracksPt', 'ECAL_E',
+    'BPIX_L1', 'BPIX_L2', 'BPIX_L3', 'BPIX_L4',
+    'TIB_L1', 'TIB_L2', 'TOB_L1', 'TOB_L2',
+    'HBHE_E'
+]
+for ch, cnt in enumerate(overflow_counter):
+    print(f"{channel_names[ch]:>8s}: {cnt}")
