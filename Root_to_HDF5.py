@@ -40,21 +40,44 @@ def compress_channel(values: np.ndarray,
     hits = np.column_stack([vals, coord])   # (k, 3)
     return hits.astype(np.float32), overflow
 
-overflow_counter = np.zeros(11, dtype=np.int64)
+def compress_highres(values: np.ndarray,
+                     k: int = 1500,
+                     pad_val: float = -np.inf):
+    # strip the sentinel
+    mask   = values != -999
+    if not mask.any():
+        # no real hits at all
+        return np.full(k, pad_val, dtype=np.float32), False
 
-ECAL_eta = np.linspace(-3, 3, 56).reshape(56, 1)
-ECAL_phi = np.linspace(-np.pi, np.pi, 72).reshape(1, 72)
-ECAL_etaphi = np.ones((56, 72, 2))
-ECAL_etaphi[:, :, 0] *= ECAL_eta
-ECAL_etaphi[:, :, 1] *= ECAL_phi
-ECAL_etaphi = ECAL_etaphi.reshape(56*72,2)
+    vals = values[mask].astype(np.float32)
 
-HCAL_eta = np.linspace(-3, 3, 280).reshape(280,1)
-HCAL_phi = np.linspace(-np.pi, np.pi, 360).reshape(1, 360)
-HCAL_etaphi = np.ones((280, 360, 2))
+    if vals.size > k:                          # too many -> take top-k
+        sel     = np.argpartition(-vals, k-1)[:k]
+        vals    = vals[sel]
+        overflow = True
+    else:                                      # too few -> pad
+        pad      = k - vals.size
+        vals     = np.concatenate([vals,
+                                   np.full(pad, pad_val, dtype=np.float32)])
+        overflow = False
+
+    return vals, overflow
+
+overflow_counter = np.zeros(32, dtype=np.int64)
+
+HCAL_eta = np.linspace(-3, 3, 56).reshape(56, 1)
+HCAL_phi = np.linspace(-np.pi, np.pi, 72).reshape(1, 72)
+HCAL_etaphi = np.ones((56, 72, 2))
 HCAL_etaphi[:, :, 0] *= HCAL_eta
 HCAL_etaphi[:, :, 1] *= HCAL_phi
-HCAL_etaphi = HCAL_etaphi.reshape(280*360,2)
+HCAL_etaphi = HCAL_etaphi.reshape(56*72,2)
+
+ECAL_eta = np.linspace(-3, 3, 280).reshape(280,1)
+ECAL_phi = np.linspace(-np.pi, np.pi, 360).reshape(1, 360)
+ECAL_etaphi = np.ones((280, 360, 2))
+ECAL_etaphi[:, :, 0] *= ECAL_eta
+ECAL_etaphi[:, :, 1] *= ECAL_phi
+ECAL_etaphi = ECAL_etaphi.reshape(280*360,2)
 
 rhTreeStr = args.infile
 rhTree = ROOT.TChain("fevt/RHTree")
@@ -77,7 +100,7 @@ sw.Start()
 with h5py.File(outStr, "w") as proper_data:
 
     # geometry-dependent constants
-    HIT_SHAPE   = (1500, 11, 3)           # one row ->  zero-suppressed hit matrix
+    HIT_SHAPE   = (1500, 32, 3)           # one row ->  zero-suppressed hit matrix
     SCALAR_SHAPE = (1,)                   # one row ->  any single scalar value
 
     dataset_names = [
@@ -125,33 +148,63 @@ with h5py.File(outStr, "w") as proper_data:
             print(" .. Processing entry", iEvt)
 
         HighResCollection = np.stack([
-            np.array(rhTree.ECAL_tracksPt_atECALfixIP).reshape(280*360),
-            np.array(rhTree.ECAL_energy).reshape(280*360),
-            np.array(rhTree.BPIX_layer1_ECAL_atPV).reshape(280*360),
-            np.array(rhTree.BPIX_layer2_ECAL_atPV).reshape(280*360),
-            np.array(rhTree.BPIX_layer3_ECAL_atPV).reshape(280*360),
-            np.array(rhTree.BPIX_layer4_ECAL_atPV).reshape(280*360),
-            np.array(rhTree.TIB_layer1_ECAL_atPV).reshape(280*360),
-            np.array(rhTree.TIB_layer2_ECAL_atPV).reshape(280*360),
-            np.array(rhTree.TOB_layer1_ECAL_atPV).reshape(280*360),
-            np.array(rhTree.TOB_layer2_ECAL_atPV).reshape(280*360)
+            np.array(rhTree.ECAL_tracksPt_atECALfixIP).reshape(5000),
+            np.array(rhTree.BPIX_layer1_triplets_atPV).reshape(5000),
+            np.array(rhTree.BPIX_layer2_triplets_atPV).reshape(5000),
+            np.array(rhTree.BPIX_layer3_triplets_atPV).reshape(5000),
+            np.array(rhTree.BPIX_layer4_triplets_atPV).reshape(5000),
+            np.array(rhTree.FPIX_layer1_triplets_atPV).reshape(5000),
+            np.array(rhTree.FPIX_layer2_triplets_atPV).reshape(5000),
+            np.array(rhTree.FPIX_layer3_triplets_atPV).reshape(5000),
+            np.array(rhTree.TIB_layer1_triplets_atPV).reshape(5000),
+            np.array(rhTree.TIB_layer2_triplets_atPV).reshape(5000),
+            np.array(rhTree.TIB_layer3_triplets_atPV).reshape(5000),
+            np.array(rhTree.TIB_layer4_triplets_atPV).reshape(5000),
+            np.array(rhTree.TID_layer1_triplets_atPV).reshape(5000),
+            np.array(rhTree.TID_layer2_triplets_atPV).reshape(5000),
+            np.array(rhTree.TID_layer3_triplets_atPV).reshape(5000),
+            np.array(rhTree.TOB_layer1_triplets_atPV).reshape(5000),
+            np.array(rhTree.TOB_layer2_triplets_atPV).reshape(5000),
+            np.array(rhTree.TOB_layer3_triplets_atPV).reshape(5000),
+            np.array(rhTree.TOB_layer4_triplets_atPV).reshape(5000),
+            np.array(rhTree.TOB_layer5_triplets_atPV).reshape(5000),
+            np.array(rhTree.TOB_layer6_triplets_atPV).reshape(5000),
+            np.array(rhTree.TEC_layer1_triplets_atPV).reshape(5000),
+            np.array(rhTree.TEC_layer2_triplets_atPV).reshape(5000),
+            np.array(rhTree.TEC_layer3_triplets_atPV).reshape(5000),
+            np.array(rhTree.TEC_layer4_triplets_atPV).reshape(5000),
+            np.array(rhTree.TEC_layer5_triplets_atPV).reshape(5000),
+            np.array(rhTree.TEC_layer6_triplets_atPV).reshape(5000),
+            np.array(rhTree.TEC_layer7_triplets_atPV).reshape(5000),
+            np.array(rhTree.TEC_layer8_triplets_atPV).reshape(5000),
+            np.array(rhTree.TEC_layer9_triplets_atPV).reshape(5000),
         ], axis=1)
 
-        hit_matrix = np.full((1500, 11, 3), -np.inf, dtype=np.float32)
+        hit_matrix = np.full((1500, 32, 3), -np.inf, dtype=np.float32)
 
-        # 10 high-resolution channels (HCAL grid for coordinates)
-        for ch in range(10):
-            hit_slice, over = compress_channel(HighResCollection[:, ch], HCAL_etaphi, 1500, 1e-4)
-            hit_matrix[:, ch, :] = hit_slice
-            if over:
-                overflow_counter[ch] += 1
-
+        # ECAL energy
+        ECAL_energy = np.array(rhTree.ECAL_energy).reshape(280*360)
+        hit_slice, over = compress_channel(ECAL_energy, ECAL_etaphi, 1500, 1e-4)
+        hit_matrix[:, 30, :] = hit_slice
+        if over:
+            overflow_counter[30] += 1
+      
         # HBHE channel (ECAL grid for coordinates)
         HBHE_energy = np.array(rhTree.HBHE_energy).reshape(56*72)
-        hit_slice, over = compress_channel(HBHE_energy, ECAL_etaphi, 1500, 1e-4)
-        hit_matrix[:, 10, :] = hit_slice
+        hit_slice, over = compress_channel(HBHE_energy, HCAL_etaphi, 1500, 1e-4)
+        hit_matrix[:, 31, :] = hit_slice
         if over:
-            overflow_counter[10] += 1
+            overflow_counter[31] += 1
+
+        for ch in range(30):
+            hits, over = compress_highres(HighResCollection[:, ch], k=1500)
+
+            # store the values in the first column; coords stay –inf
+            hit_matrix[:, ch, 0] = hits                 # values
+            # hit_matrix[:, ch, 1:3] are already –inf from the initial fill
+
+            if over:
+                overflow_counter[ch] += 1
 
 
         # fill the in-RAM buffer
