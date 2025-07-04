@@ -40,29 +40,37 @@ def compress_channel(values: np.ndarray,
     hits = np.column_stack([vals, coord])   # (k, 3)
     return hits.astype(np.float32), overflow
 
-def compress_highres(values: np.ndarray,
+def compress_highres(triplets: np.ndarray,
                      k: int = 1500,
-                     pad_val: float = -np.inf):
-    # strip the sentinel
-    mask   = values != -999
+                     thresh: float = 1e-4,
+                     pad_val: float = -999.0):
+   # Pull out just the energy column
+    values = triplets[:, 0]
+
+    # Mask away padding rows and low-energy hits
+    mask = (values > thresh) & (values > pad_val + 1.0)   # +1 guards numerical noise
     if not mask.any():
-        # no real hits at all
-        return np.full(k, pad_val, dtype=np.float32), False
+        return np.full(k, -np.inf, dtype=np.float32), False
 
-    vals = values[mask].astype(np.float32)
+    vals = values[mask]
 
-    if vals.size > k:                          # too many -> take top-k
-        sel     = np.argpartition(-vals, k-1)[:k]
-        vals    = vals[sel]
+    # If we have too many, keep the top-k energies (argpartition is O(N))
+    if vals.shape[0] > k:
+        top_idx = np.argpartition(-vals, k - 1)[:k]
+        vals = vals[top_idx]
         overflow = True
-    else:                                      # too few -> pad
-        pad      = k - vals.size
-        vals     = np.concatenate([vals,
-                                   np.full(pad, pad_val, dtype=np.float32)])
+    else:
         overflow = False
+        # Pad with –inf so every return has the same length
+        pad = k - vals.shape[0]
+        if pad:
+            vals = np.concatenate([vals, np.full(pad, -np.inf, dtype=np.float32)])
 
-    return vals, overflow
+    # Sort descending so the first entries are always the strongest hits
+    hits = np.sort(vals)[::-1].astype(np.float32)
 
+    return hits, overflow
+                     
 overflow_counter = np.zeros(32, dtype=np.int64)
 
 HCAL_eta = np.linspace(-3, 3, 56).reshape(56, 1)
@@ -148,36 +156,36 @@ with h5py.File(outStr, "w") as proper_data:
             print(" .. Processing entry", iEvt)
 
         HighResCollection = np.stack([
-            np.array(rhTree.ECAL_tracksPt_triplet).reshape(5000),
-            np.array(rhTree.BPIX_layer1_triplets_atPV).reshape(5000),
-            np.array(rhTree.BPIX_layer2_triplets_atPV).reshape(5000),
-            np.array(rhTree.BPIX_layer3_triplets_atPV).reshape(5000),
-            np.array(rhTree.BPIX_layer4_triplets_atPV).reshape(5000),
-            np.array(rhTree.FPIX_layer1_triplets_atPV).reshape(5000),
-            np.array(rhTree.FPIX_layer2_triplets_atPV).reshape(5000),
-            np.array(rhTree.FPIX_layer3_triplets_atPV).reshape(5000),
-            np.array(rhTree.TIB_layer1_triplets_atPV).reshape(5000),
-            np.array(rhTree.TIB_layer2_triplets_atPV).reshape(5000),
-            np.array(rhTree.TIB_layer3_triplets_atPV).reshape(5000),
-            np.array(rhTree.TIB_layer4_triplets_atPV).reshape(5000),
-            np.array(rhTree.TID_layer1_triplets_atPV).reshape(5000),
-            np.array(rhTree.TID_layer2_triplets_atPV).reshape(5000),
-            np.array(rhTree.TID_layer3_triplets_atPV).reshape(5000),
-            np.array(rhTree.TOB_layer1_triplets_atPV).reshape(5000),
-            np.array(rhTree.TOB_layer2_triplets_atPV).reshape(5000),
-            np.array(rhTree.TOB_layer3_triplets_atPV).reshape(5000),
-            np.array(rhTree.TOB_layer4_triplets_atPV).reshape(5000),
-            np.array(rhTree.TOB_layer5_triplets_atPV).reshape(5000),
-            np.array(rhTree.TOB_layer6_triplets_atPV).reshape(5000),
-            np.array(rhTree.TEC_layer1_triplets_atPV).reshape(5000),
-            np.array(rhTree.TEC_layer2_triplets_atPV).reshape(5000),
-            np.array(rhTree.TEC_layer3_triplets_atPV).reshape(5000),
-            np.array(rhTree.TEC_layer4_triplets_atPV).reshape(5000),
-            np.array(rhTree.TEC_layer5_triplets_atPV).reshape(5000),
-            np.array(rhTree.TEC_layer6_triplets_atPV).reshape(5000),
-            np.array(rhTree.TEC_layer7_triplets_atPV).reshape(5000),
-            np.array(rhTree.TEC_layer8_triplets_atPV).reshape(5000),
-            np.array(rhTree.TEC_layer9_triplets_atPV).reshape(5000),
+            np.array(rhTree.ECAL_tracksPt_triplet_atECALfixIP).reshape(5000,3),
+            np.array(rhTree.BPIX_layer1_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.BPIX_layer2_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.BPIX_layer3_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.BPIX_layer4_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.FPIX_layer1_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.FPIX_layer2_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.FPIX_layer3_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TIB_layer1_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TIB_layer2_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TIB_layer3_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TIB_layer4_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TID_layer1_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TID_layer2_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TID_layer3_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TOB_layer1_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TOB_layer2_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TOB_layer3_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TOB_layer4_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TOB_layer5_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TOB_layer6_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TEC_layer1_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TEC_layer2_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TEC_layer3_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TEC_layer4_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TEC_layer5_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TEC_layer6_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TEC_layer7_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TEC_layer8_triplets_atPV).reshape(5000,3),
+            np.array(rhTree.TEC_layer9_triplets_atPV).reshape(5000,3),
         ], axis=1)
 
         hit_matrix = np.full((1500, 32, 3), -np.inf, dtype=np.float32)
