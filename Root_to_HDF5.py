@@ -148,7 +148,7 @@ with h5py.File(outStr, "w") as proper_data:
             print(" .. Processing entry", iEvt)
 
         HighResCollection = np.stack([
-            np.array(rhTree.ECAL_tracksPt_atECALfixIP).reshape(5000),
+            np.array(rhTree.ECAL_tracksPt_triplet).reshape(5000),
             np.array(rhTree.BPIX_layer1_triplets_atPV).reshape(5000),
             np.array(rhTree.BPIX_layer2_triplets_atPV).reshape(5000),
             np.array(rhTree.BPIX_layer3_triplets_atPV).reshape(5000),
