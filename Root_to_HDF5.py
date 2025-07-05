@@ -13,6 +13,15 @@ parser.add_argument('-c', '--chunk_size', default=32, type=int, help='chunk size
 args = parser.parse_args()
 chunk_size = args.chunk_size
 
+SENTINEL = np.float32(np.nan)          # pick -999. or another value if preferred
+
+def safe_first(branch, default=SENTINEL):
+    """
+    Return the first element of a ROOT std::vector<float> branch.
+    If the vector is empty, return `default` instead of raising IndexError.
+    """
+    return branch[0] if len(branch) else default
+
 def compress_channel(values: np.ndarray,
                      coords:  np.ndarray,
                      k: int = 1500,
@@ -61,7 +70,7 @@ def compress_highres(triplets: np.ndarray,
         overflow = True
     else:
         overflow = False
-        # Pad with –inf so every return has the same length
+        # Pad with -inf so every return has the same length
         pad = k - vals.shape[0]
         if pad:
             vals = np.concatenate([vals, np.full(pad, -np.inf, dtype=np.float32)])
@@ -207,9 +216,9 @@ with h5py.File(outStr, "w") as proper_data:
         for ch in range(30):
             hits, over = compress_highres(HighResCollection[:, ch], k=1500)
 
-            # store the values in the first column; coords stay –inf
+            # store the values in the first column; coords stay -inf
             hit_matrix[:, ch, 0] = hits                 # values
-            # hit_matrix[:, ch, 1:3] are already –inf from the initial fill
+            # hit_matrix[:, ch, 1:3] are already -inf from the initial fill
 
             if over:
                 overflow_counter[ch] += 1
@@ -217,26 +226,20 @@ with h5py.File(outStr, "w") as proper_data:
 
         # fill the in-RAM buffer
         hit_buffer[buf_fill, :, :, :] = hit_matrix
-        scalar_buffers['A_diphoton_gen_m0' ][buf_fill, 0] = rhTree.A_diphoton_gen_m0[0]
-        scalar_buffers['A_diphoton_gen_dR' ][buf_fill, 0] = rhTree.A_diphoton_gen_dR[0]
-        scalar_buffers['A_diphoton_gen_E'  ][buf_fill, 0] = rhTree.A_diphoton_gen_E[0]
-        scalar_buffers['A_diphoton_gen_pT' ][buf_fill, 0] = rhTree.A_diphoton_gen_pT[0]
-        scalar_buffers['A_diphoton_gen_eta'][buf_fill, 0] = rhTree.A_diphoton_gen_eta[0]
-        scalar_buffers['A_diphoton_gen_phi'][buf_fill, 0] = rhTree.A_diphoton_gen_phi[0]
+        scalar_branch_names = [
+            # diphoton - gen
+            'A_diphoton_gen_m0',  'A_diphoton_gen_dR',  'A_diphoton_gen_E',
+            'A_diphoton_gen_pT',  'A_diphoton_gen_eta', 'A_diphoton_gen_phi',
+            # diphoton - reco
+            'A_diphoton_reco_M',  'A_diphoton_reco_dR', 'A_diphoton_reco_E',
+            'A_diphoton_reco_pT', 'A_diphoton_reco_eta','A_diphoton_reco_phi',
+            # ditau - gen
+            'A_ditau_gen_m0',     'A_ditau_gen_dR',     'A_ditau_gen_E',
+            'A_ditau_gen_pT',     'A_ditau_gen_eta',    'A_ditau_gen_phi'
+        ]
 
-        scalar_buffers['A_diphoton_reco_M' ][buf_fill, 0] = rhTree.A_diphoton_reco_M[0]
-        scalar_buffers['A_diphoton_reco_dR'][buf_fill, 0] = rhTree.A_diphoton_reco_dR[0]
-        scalar_buffers['A_diphoton_reco_E' ][buf_fill, 0] = rhTree.A_diphoton_reco_E[0]
-        scalar_buffers['A_diphoton_reco_pT'][buf_fill, 0] = rhTree.A_diphoton_reco_pT[0]
-        scalar_buffers['A_diphoton_reco_eta'][buf_fill, 0] = rhTree.A_diphoton_reco_eta[0]
-        scalar_buffers['A_diphoton_reco_phi'][buf_fill, 0] = rhTree.A_diphoton_reco_phi[0]
-
-        scalar_buffers['A_ditau_gen_m0'    ][buf_fill, 0] = rhTree.A_ditau_gen_m0[0]
-        scalar_buffers['A_ditau_gen_dR'    ][buf_fill, 0] = rhTree.A_ditau_gen_dR[0]
-        scalar_buffers['A_ditau_gen_E'     ][buf_fill, 0] = rhTree.A_ditau_gen_E[0]
-        scalar_buffers['A_ditau_gen_pT'    ][buf_fill, 0] = rhTree.A_ditau_gen_pT[0]
-        scalar_buffers['A_ditau_gen_eta'   ][buf_fill, 0] = rhTree.A_ditau_gen_eta[0]
-        scalar_buffers['A_ditau_gen_phi'   ][buf_fill, 0] = rhTree.A_ditau_gen_phi[0]
+        for name in scalar_branch_names:
+            scalar_buffers[name][buf_fill, 0] = safe_first(getattr(rhTree, name))
 
         buf_fill += 1
 
