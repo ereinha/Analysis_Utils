@@ -1,276 +1,270 @@
+import argparse
 import h5py
+import sys
+
 import ROOT
 import numpy as np
 
-import argparse
 
-parser = argparse.ArgumentParser(description='Process some integers.')
-parser.add_argument('-i', '--infile', default='output_qqgg.root', type=str, help='Input root file.')
-parser.add_argument('-o', '--outdir', default='.', type=str, help='Output pq file dir.')
-parser.add_argument('-d', '--decay', default='test', type=str, help='Decay name.')
-parser.add_argument('-n', '--idx', default=0, type=int, help='Input root file index.')
-parser.add_argument('-c', '--chunk_size', default=32, type=int, help='chunk size for h5 file')
-args = parser.parse_args()
-chunk_size = args.chunk_size
-
-SENTINEL = np.float32(np.nan)          # pick -999. or another value if preferred
-
-def safe_first(branch, default=SENTINEL):
-    """
-    Return the first element of a ROOT std::vector<float> branch.
-    If the vector is empty, return `default` instead of raising IndexError.
-    """
-    return branch[0] if len(branch) else default
-
-def compress_channel(values: np.ndarray,
-                     coords:  np.ndarray,
-                     k: int = 1500,
-                     thresh: float = 1e-4):
-    mask         = values > thresh
+def compress_channel(
+    values: np.ndarray,
+    coords: np.ndarray,
+    out: np.ndarray,
+    *,
+    k: int = 1500,
+    thresh: float = 1e-4,
+) -> bool:
+    mask = values > thresh
     if not mask.any():
-        # no hits above threshold
-        return np.full((k, 3), -np.inf, dtype=np.float32), False
+        out[:] = -np.inf
+        return False
 
-    vals   = values[mask]
-    coord  = coords[mask]
+    vals = values[mask]
+    coord = coords[mask]
 
-    # if too many hits, pick top k hits and remember the overflow
-    if vals.shape[0] > k:
-        top_idx = np.argpartition(-vals, k - 1)[:k]   # O(N)
+    if vals.size > k:
+        top_idx = np.argpartition(-vals, k - 1)[:k]
         vals, coord = vals[top_idx], coord[top_idx]
         overflow = True
     else:
         overflow = False
-        pad = k - vals.shape[0]
-        # pad with -inf
-        vals   = np.concatenate([vals,   np.full(pad, -np.inf, dtype=np.float32)])
-        coord  = np.concatenate([coord,  np.full((pad, 2), -np.inf, dtype=np.float32)])
 
-    hits = np.column_stack([vals, coord])   # (k, 3)
-    return hits.astype(np.float32), overflow
+    n = vals.size
+    out[:n, 0] = vals.astype(np.float32, copy=False)
+    out[:n, 1:] = coord.astype(np.float32, copy=False)
+    if n < k:
+        out[n:, :] = -np.inf
+    return overflow
 
-def compress_highres(triplets: np.ndarray,
-                     k: int = 1500,
-                     thresh: float = 1e-4,
-                     pad_val: float = -999.0):
-   # Pull out just the energy column
+
+def compress_highres(
+    triplets: np.ndarray,
+    out: np.ndarray,
+    *,
+    k: int = 1500,
+    thresh: float = 1e-4,
+    pad_val: float = -999.0,
+) -> bool:
     values = triplets[:, 0]
-
-    # Mask away padding rows and low-energy hits
-    mask = (values > thresh) & (values > pad_val + 1.0)   # +1 guards numerical noise
+    mask = (values > thresh) & (values > pad_val + 1.0)
     if not mask.any():
-        return np.full(k, -np.inf, dtype=np.float32), False
+        out[:] = -np.inf
+        return False
 
     vals = values[mask]
-
-    # If we have too many, keep the top-k energies (argpartition is O(N))
-    if vals.shape[0] > k:
+    if vals.size > k:
         top_idx = np.argpartition(-vals, k - 1)[:k]
         vals = vals[top_idx]
         overflow = True
     else:
         overflow = False
-        # Pad with -inf so every return has the same length
-        pad = k - vals.shape[0]
-        if pad:
-            vals = np.concatenate([vals, np.full(pad, -np.inf, dtype=np.float32)])
 
-    # Sort descending so the first entries are always the strongest hits
-    hits = np.sort(vals)[::-1].astype(np.float32)
+    # write and pad
+    n = vals.size
+    out[:n] = vals.astype(np.float32, copy=False)
+    if n < k:
+        out[n:] = -np.inf
 
-    return hits, overflow
-                     
-overflow_counter = np.zeros(32, dtype=np.int64)
-
-HCAL_eta = np.linspace(-3, 3, 56).reshape(56, 1)
-HCAL_phi = np.linspace(-np.pi, np.pi, 72).reshape(1, 72)
-HCAL_etaphi = np.ones((56, 72, 2))
-HCAL_etaphi[:, :, 0] *= HCAL_eta
-HCAL_etaphi[:, :, 1] *= HCAL_phi
-HCAL_etaphi = HCAL_etaphi.reshape(56*72,2)
-
-ECAL_eta = np.linspace(-3, 3, 280).reshape(280,1)
-ECAL_phi = np.linspace(-np.pi, np.pi, 360).reshape(1, 360)
-ECAL_etaphi = np.ones((280, 360, 2))
-ECAL_etaphi[:, :, 0] *= ECAL_eta
-ECAL_etaphi[:, :, 1] *= ECAL_phi
-ECAL_etaphi = ECAL_etaphi.reshape(280*360,2)
-
-rhTreeStr = args.infile
-rhTree = ROOT.TChain("fevt/RHTree")
-rhTree.Add(rhTreeStr)
-nEvts = rhTree.GetEntries()
-assert nEvts > 0
-print (" >> Input file:",rhTreeStr)
-print (" >> nEvts:",nEvts)
-outStr = '%s/%s_%s.h5'%(args.outdir, args.decay, args.idx)
-print (" >> Output file:",outStr)
+    # sort descending for determinism
+    out[:k] = np.sort(out[:k])[::-1]
+    return overflow
 
 
-iEvtStart = 0
-iEvtEnd   = nEvts
-assert iEvtEnd <= nEvts
-print(" >> Processing entries: [",iEvtStart,"->",iEvtEnd,")")
+# Main
+def main(args):
+    chunk_size = args.chunk_size
 
-sw = ROOT.TStopwatch()
-sw.Start()
-with h5py.File(outStr, "w") as proper_data:
+    # Geometry constants
+    HCAL_eta = np.linspace(-3, 3, 56, dtype=np.float32).reshape(56, 1)
+    HCAL_phi = np.linspace(-np.pi, np.pi, 72, dtype=np.float32).reshape(1, 72)
+    HCAL_etaphi = np.stack((np.broadcast_to(HCAL_eta, (56, 72)),
+                            np.broadcast_to(HCAL_phi, (56, 72))), axis=-1).reshape(-1, 2)
 
-    # geometry-dependent constants
-    HIT_SHAPE   = (1500, 32, 3)           # one row ->  zero-suppressed hit matrix
-    SCALAR_SHAPE = (1,)                   # one row ->  any single scalar value
+    ECAL_eta = np.linspace(-3, 3, 280, dtype=np.float32).reshape(280, 1)
+    ECAL_phi = np.linspace(-np.pi, np.pi, 360, dtype=np.float32).reshape(1, 360)
+    ECAL_etaphi = np.stack((np.broadcast_to(ECAL_eta, (280, 360)),
+                            np.broadcast_to(ECAL_phi, (280, 360))), axis=-1).reshape(-1, 2)
+
+    # Set up ROOT TChain and pre-selection
+    rhTree = ROOT.TChain("fevt/RHTree")
+    if rhTree.Add(args.infile) == 0:
+        sys.exit(f"[error] Could not open {args.infile}")
+
+    nEvts = rhTree.GetEntries()
+    print(f" >> Input file:  {args.infile}\n >> nEvts:       {nEvts}")
+
+    def get_valid_event_indices(chain: ROOT.TChain, key: str = "A_diphoton_gen_m0") -> list[int]:
+        good: list[int] = []
+        n = chain.GetEntries()
+        print(f" >> Pre-scan: looping over {n} events to check '{key}'...")
+        for i in range(n):
+            chain.GetEntry(i)
+            if len(getattr(chain, key)):
+                good.append(i)
+            if i and i % max(1, n // 20) == 0:
+                print(f"    ... {100 * i / n:4.0f}%")
+        return good
+
+    valid_indices = get_valid_event_indices(rhTree)
+    nGood = len(valid_indices)
+    if nGood == 0:
+        sys.exit("[error] No events survived pre-selection.")
+
+    print(f" >> {nGood}/{nEvts} events ({100 * nGood / nEvts:.1f} %) after pre-selection")
+
+    # Dataset definitions
+    HIT_SHAPE = (1500, 32, 3)
+    SCALAR_SHAPE = (1,)
 
     dataset_names = [
-        'A_diphoton_gen_m0',  'A_diphoton_gen_dR',  'A_diphoton_gen_E',
-        'A_diphoton_gen_pT',  'A_diphoton_gen_eta', 'A_diphoton_gen_phi',
-        'A_diphoton_reco_M',  'A_diphoton_reco_dR', 'A_diphoton_reco_E',
-        'A_diphoton_reco_pT', 'A_diphoton_reco_eta','A_diphoton_reco_phi',
-        'A_ditau_gen_m0',     'A_ditau_gen_dR',     'A_ditau_gen_E',
-        'A_ditau_gen_pT',     'A_ditau_gen_eta',    'A_ditau_gen_phi',
-        'zero_suppressed_hit_collection'
+        # diphoton - gen
+        "A_diphoton_gen_m0",  "A_diphoton_gen_dR",  "A_diphoton_gen_E",
+        "A_diphoton_gen_pT",  "A_diphoton_gen_eta", "A_diphoton_gen_phi",
+        # diphoton - reco
+        "A_diphoton_reco_M",  "A_diphoton_reco_dR", "A_diphoton_reco_E",
+        "A_diphoton_reco_pT", "A_diphoton_reco_eta","A_diphoton_reco_phi",
+        # ditau - gen
+        "A_ditau_gen_m0",     "A_ditau_gen_dR",     "A_ditau_gen_E",
+        "A_ditau_gen_pT",     "A_ditau_gen_eta",    "A_ditau_gen_phi",
+        # hits
+        "zero_suppressed_hit_collection",
     ]
 
-    dsets = {}
-    for name in dataset_names:
-        if name == 'zero_suppressed_hit_collection':
+    scalar_branches = [n for n in dataset_names if n != "zero_suppressed_hit_collection"]
+
+    out_path = f"{args.outdir}/{args.decay}_{args.idx}.h5"
+    print(f" >> Output file: {out_path}")
+
+    # overflow bookkeeping
+    overflow_counter = np.zeros(32, dtype=np.int64)
+
+    # High-res tracker branch list (order defines channel index 0-29)
+    HIGHRES_BRANCHES = [
+        "ECAL_tracksPt_triplet_atECALfixIP",
+        "BPIX_layer1_triplets_atPV", "BPIX_layer2_triplets_atPV", "BPIX_layer3_triplets_atPV", "BPIX_layer4_triplets_atPV",
+        "FPIX_layer1_triplets_atPV", "FPIX_layer2_triplets_atPV", "FPIX_layer3_triplets_atPV",
+        "TIB_layer1_triplets_atPV", "TIB_layer2_triplets_atPV", "TIB_layer3_triplets_atPV", "TIB_layer4_triplets_atPV",
+        "TID_layer1_triplets_atPV", "TID_layer2_triplets_atPV", "TID_layer3_triplets_atPV",
+        "TOB_layer1_triplets_atPV", "TOB_layer2_triplets_atPV", "TOB_layer3_triplets_atPV", "TOB_layer4_triplets_atPV",
+        "TOB_layer5_triplets_atPV", "TOB_layer6_triplets_atPV",
+        "TEC_layer1_triplets_atPV", "TEC_layer2_triplets_atPV", "TEC_layer3_triplets_atPV", "TEC_layer4_triplets_atPV",
+        "TEC_layer5_triplets_atPV", "TEC_layer6_triplets_atPV", "TEC_layer7_triplets_atPV", "TEC_layer8_triplets_atPV",
+        "TEC_layer9_triplets_atPV",
+    ]
+
+    # Pre-allocate working buffers (reused every event)
+    hit_matrix = np.empty(HIT_SHAPE, dtype=np.float32)        # event-local, reused
+    triplet_buffer = np.empty((5000, 3), dtype=np.float32)    # view for high-res branch
+
+    # HDF5 in-RAM staging buffers - sized to chunk boundaries
+    BUFFER_ROWS = chunk_size * 8
+    hit_buffer = np.empty((BUFFER_ROWS, *HIT_SHAPE), dtype=np.float32)
+    scalar_buffers = {n: np.empty((BUFFER_ROWS, 1), dtype=np.float32) for n in scalar_branches}
+
+    # Start conversion
+    sw = ROOT.TStopwatch()
+    sw.Start()
+
+    with h5py.File(out_path, "w") as proper_data:
+        dsets = {}
+        for name in dataset_names:
+            shape = (nGood, *HIT_SHAPE) if name == "zero_suppressed_hit_collection" else (nGood, *SCALAR_SHAPE)
+            chunks = (chunk_size, *HIT_SHAPE) if name == "zero_suppressed_hit_collection" else (chunk_size, *SCALAR_SHAPE)
             dsets[name] = proper_data.create_dataset(
                 name,
-                shape=(nEvts, *HIT_SHAPE),
-                dtype='float32',
-                compression='lzf',
-                chunks=(args.chunk_size, *HIT_SHAPE)   # keep fast chunking on disk
-            )
-        else:
-            dsets[name] = proper_data.create_dataset(
-                name,
-                shape=(nEvts, *SCALAR_SHAPE),
-                dtype='float32',
-                compression='lzf',
-                chunks=(args.chunk_size, *SCALAR_SHAPE)
+                shape=shape,
+                dtype="float32",
+                compression="lzf",
+                chunks=chunks,
             )
 
+        write_head = 0  # next row to write to HDF5
+        buf_fill = 0    # how many rows are currently in in-RAM buffer
 
-    BUFFER_ROWS      = args.chunk_size * 32     # any multiple of chunk size works
-    hit_buffer       = np.empty((BUFFER_ROWS, *HIT_SHAPE),   dtype=np.float32)
-    scalar_buffers   = {n: np.empty((BUFFER_ROWS, 1), dtype=np.float32)
-                        for n in dataset_names if n != 'zero_suppressed_hit_collection'}
+        for sel_idx, tree_idx in enumerate(valid_indices):
+            rhTree.GetEntry(tree_idx)
+            if sel_idx % 100 == 0:
+                print(f" .. Processing selected entry {sel_idx}/{nGood} (tree index {tree_idx})")
 
-    write_head = 0 # next row in HDF5 file to be filled
-    buf_fill   = 0 # rows currently stored in the in-memory buffer
+            # reset event buffer
+            hit_matrix.fill(-np.inf)
 
-    for iEvt in range(iEvtStart, iEvtEnd):
+            # ECAL energy
+            ECAL_energy = np.asarray(rhTree.ECAL_energy, dtype=np.float32)
+            compress_channel(
+                ECAL_energy.reshape(-1),
+                ECAL_etaphi,
+                hit_matrix[:, 30, :],
+                k=1500,
+                thresh=1e-4,
+            ) and overflow_counter.__setitem__(30, overflow_counter[30] + 1)
 
-        rhTree.GetEntry(iEvt)
-        if iEvt % 100 == 0:
-            print(" .. Processing entry", iEvt)
+            # HBHE energy
+            HBHE_energy = np.asarray(rhTree.HBHE_energy, dtype=np.float32)
+            if compress_channel(HBHE_energy.reshape(-1), HCAL_etaphi, hit_matrix[:, 31, :]):
+                overflow_counter[31] += 1
 
-        HighResCollection = np.stack([
-            np.array(rhTree.ECAL_tracksPt_triplet_atECALfixIP).reshape(5000,3),
-            np.array(rhTree.BPIX_layer1_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.BPIX_layer2_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.BPIX_layer3_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.BPIX_layer4_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.FPIX_layer1_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.FPIX_layer2_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.FPIX_layer3_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TIB_layer1_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TIB_layer2_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TIB_layer3_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TIB_layer4_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TID_layer1_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TID_layer2_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TID_layer3_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TOB_layer1_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TOB_layer2_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TOB_layer3_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TOB_layer4_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TOB_layer5_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TOB_layer6_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TEC_layer1_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TEC_layer2_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TEC_layer3_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TEC_layer4_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TEC_layer5_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TEC_layer6_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TEC_layer7_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TEC_layer8_triplets_atPV).reshape(5000,3),
-            np.array(rhTree.TEC_layer9_triplets_atPV).reshape(5000,3),
-        ], axis=1)
+            # High-resolution tracker hits (30 branches)
+            for ch, branch in enumerate(HIGHRES_BRANCHES):
+                triplet_buffer[:] = np.asarray(getattr(rhTree, branch), dtype=np.float32).reshape(5000, 3)
+                if compress_highres(triplet_buffer, hit_matrix[:, ch, 0]):
+                    overflow_counter[ch] += 1
 
-        hit_matrix = np.full((1500, 32, 3), -np.inf, dtype=np.float32)
+            # Scalars
+            for name in scalar_branches:
+                scalar_buffers[name][buf_fill, 0] = getattr(rhTree, name)[0]
 
-        # ECAL energy
-        ECAL_energy = np.array(rhTree.ECAL_energy).reshape(280*360)
-        hit_slice, over = compress_channel(ECAL_energy, ECAL_etaphi, 1500, 1e-4)
-        hit_matrix[:, 30, :] = hit_slice
-        if over:
-            overflow_counter[30] += 1
-      
-        # HBHE channel (ECAL grid for coordinates)
-        HBHE_energy = np.array(rhTree.HBHE_energy).reshape(56*72)
-        hit_slice, over = compress_channel(HBHE_energy, HCAL_etaphi, 1500, 1e-4)
-        hit_matrix[:, 31, :] = hit_slice
-        if over:
-            overflow_counter[31] += 1
+            # stage into RAM buffer
+            hit_buffer[buf_fill, :, :, :] = hit_matrix
+            buf_fill += 1
 
-        for ch in range(30):
-            hits, over = compress_highres(HighResCollection[:, ch], k=1500)
+            # flush if full
+            if buf_fill == BUFFER_ROWS:
+                slice_ = slice(write_head, write_head + buf_fill)
+                dsets["zero_suppressed_hit_collection"][slice_, :, :, :] = hit_buffer
+                for n in scalar_branches:
+                    dsets[n][slice_, :] = scalar_buffers[n]
+                write_head += buf_fill
+                buf_fill = 0
 
-            # store the values in the first column; coords stay -inf
-            hit_matrix[:, ch, 0] = hits                 # values
-            # hit_matrix[:, ch, 1:3] are already -inf from the initial fill
-
-            if over:
-                overflow_counter[ch] += 1
-
-
-        # fill the in-RAM buffer
-        hit_buffer[buf_fill, :, :, :] = hit_matrix
-        scalar_branch_names = [
-            # diphoton - gen
-            'A_diphoton_gen_m0',  'A_diphoton_gen_dR',  'A_diphoton_gen_E',
-            'A_diphoton_gen_pT',  'A_diphoton_gen_eta', 'A_diphoton_gen_phi',
-            # diphoton - reco
-            'A_diphoton_reco_M',  'A_diphoton_reco_dR', 'A_diphoton_reco_E',
-            'A_diphoton_reco_pT', 'A_diphoton_reco_eta','A_diphoton_reco_phi',
-            # ditau - gen
-            'A_ditau_gen_m0',     'A_ditau_gen_dR',     'A_ditau_gen_E',
-            'A_ditau_gen_pT',     'A_ditau_gen_eta',    'A_ditau_gen_phi'
-        ]
-
-        for name in scalar_branch_names:
-            scalar_buffers[name][buf_fill, 0] = safe_first(getattr(rhTree, name))
-
-        buf_fill += 1
-
-        if buf_fill == BUFFER_ROWS:
+        # flush trailing rows
+        if buf_fill:
             slice_ = slice(write_head, write_head + buf_fill)
-            dsets['zero_suppressed_hit_collection'][slice_, :, :, :] = hit_buffer
-            for n, arr in scalar_buffers.items():
-                dsets[n][slice_, :] = arr
-
+            dsets["zero_suppressed_hit_collection"][slice_, :, :, :] = hit_buffer[:buf_fill]
+            for n in scalar_branches:
+                dsets[n][slice_, :] = scalar_buffers[n][:buf_fill]
             write_head += buf_fill
-            buf_fill = 0      # reset buffer pointer
 
-    if buf_fill:
-        slice_ = slice(write_head, write_head + buf_fill)
-        dsets['zero_suppressed_hit_collection'][slice_, :, :, :] = hit_buffer[:buf_fill]
-        for n, arr in scalar_buffers.items():
-            dsets[n][slice_, :] = arr[:buf_fill]
+        assert write_head == nGood, f"Logic error - expected {nGood} rows, wrote {write_head}"
 
-        write_head += buf_fill   # (optional) sanity check
+    # ---------------------------------------------------------------------
+    # Summary
+    # ---------------------------------------------------------------------
+    print(" >> Real time:", sw.RealTime() / 60.0, "minutes")
+    print(" >> CPU time: ", sw.CpuTime()  / 60.0, "minutes")
 
-    assert write_head == nEvts, "Logic error - not all rows written!"
+    print("========================================================")
+    print("\n=== Overflow summary (events with >1500 non-zero hits) ===")
+    channel_names = [
+        "TrkPt", "ECAL_E",
+        "BPIX_L1", "BPIX_L2", "BPIX_L3", "BPIX_L4",
+        "FPIX_L1", "FPIX_L2", "FPIX_L3",
+        "TIB_L1", "TIB_L2", "TIB_L3", "TIB_L4",
+        "TID_L1", "TID_L2", "TID_L3",
+        "TOB_L1", "TOB_L2", "TOB_L3", "TOB_L4", "TOB_L5", "TOB_L6",
+        "TEC_L1", "TEC_L2", "TEC_L3", "TEC_L4", "TEC_L5", "TEC_L6", "TEC_L7", "TEC_L8", "TEC_L9",
+        "HBHE_E",
+    ]
+    for ch, cnt in enumerate(overflow_counter):
+        print(f"{channel_names[ch]:>8s}: {cnt}")
 
-print(" >> Real time:", sw.RealTime() / 60., "minutes")
-print(" >> CPU time: ", sw.CpuTime() / 60., "minutes")
-print("========================================================")
-print("\n=== Overflow summary (events that had >1500 non-zero hits) ===")
-channel_names = [
-    'TracksPt', 'ECAL_E',
-    'BPIX_L1', 'BPIX_L2', 'BPIX_L3', 'BPIX_L4',
-    'TIB_L1', 'TIB_L2', 'TOB_L1', 'TOB_L2',
-    'HBHE_E'
-]
-for ch, cnt in enumerate(overflow_counter):
-    print(f"{channel_names[ch]:>8s}: {cnt}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="ROOT -> HDF5 converter (optimized)")
+    parser.add_argument("-i", "--infile", default="output_qqgg.root", help="input ROOT file")
+    parser.add_argument("-o", "--outdir", default=".", help="output directory")
+    parser.add_argument("-d", "--decay", default="test", help="decay name")
+    parser.add_argument("-n", "--idx",   type=int, default=0, help="index tag in output filename")
+    parser.add_argument("-c", "--chunk_size", type=int, default=32, help="HDF5 chunk size")
+    args = parser.parse_args()
+    main(args)
