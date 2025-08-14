@@ -6,9 +6,10 @@ from pathlib import Path
 import h5py
 import numpy as np
 import uproot
+from uproot.source.futures import TrivialExecutor
 
 
-def compress_channel(values, coords, out, *, k=1500, thresh=1e-4):
+def compress_channel(values, coords, out, *, k=8192, thresh=1e-10):
     mask = values > thresh
     if not mask.any():
         out[:] = -np.inf
@@ -29,7 +30,7 @@ def compress_channel(values, coords, out, *, k=1500, thresh=1e-4):
     return overflow
 
 
-def compress_highres(triplets, out, *, k=1500, thresh=1e-4, pad_val=-999.0):
+def compress_highres(triplets, out, *, k=8192, thresh=1e-10, pad_val=-999.0):
     values = triplets[:, 0]
     mask = (values > thresh) & (values > pad_val + 1.0)
     if not mask.any():
@@ -56,8 +57,6 @@ def main(args):
     # geometry constants
     HCAL_eta = np.linspace(-3, 3, 56, dtype=np.float32).reshape(56, 1)
     HCAL_phi = np.linspace(-np.pi, np.pi, 72, dtype=np.float32).reshape(1, 72)
-    HCAL_etaphi = np.stack(
-        (np.broadcast_to(HCAL_eta, (56, 72)), np.broadcast_to(HCAL_phi, (56, 72))),
         axis=-1,
     ).reshape(-1, 2)
 
@@ -114,12 +113,6 @@ def main(args):
         "TOB_layer3_triplets_atPV",
         "TOB_layer4_triplets_atPV",
         "TOB_layer5_triplets_atPV",
-        "TOB_layer6_triplets_atPV",
-        "TEC_layer1_triplets_atPV",
-        "TEC_layer2_triplets_atPV",
-        "TEC_layer3_triplets_atPV",
-        "TEC_layer4_triplets_atPV",
-        "TEC_layer5_triplets_atPV",
         "TEC_layer6_triplets_atPV",
         "TEC_layer7_triplets_atPV",
         "TEC_layer8_triplets_atPV",
@@ -135,12 +128,15 @@ def main(args):
 
     print(f" >> Input file:  {args.infile}")
 
-    with uproot.open(args.infile) as f:
+    with uproot.open(args.infile, basketcache="0 B") as f:
         tree = f["fevt/RHTree"]
 
         # pre-selection
         diphoton_m0 = tree["A_diphoton_gen_m0"].array(library="np")
         valid_mask = np.fromiter((len(x) > 0 for x in diphoton_m0), dtype=bool)
+        if args.mask_path is not None:
+            mask = np.load(args.mask_path).astype(bool)
+            valid_mask = np.logical_and(valid_mask, mask)
         valid_indices = np.nonzero(valid_mask)[0]
         nGood = valid_indices.size
         nEvts = tree.num_entries
@@ -152,7 +148,7 @@ def main(args):
         )
 
         # shapes
-        HIT_SHAPE = (1500, 32, 3)
+        HIT_SHAPE = (8192, 32, 3)
         SCALAR_SHAPE = (1,)
 
         out_path = f"{args.outdir}/{args.decay}_{args.idx}.h5"
@@ -161,7 +157,7 @@ def main(args):
         overflow_counter = np.zeros(32, dtype=np.int64)
 
         hit_matrix = np.empty(HIT_SHAPE, dtype=np.float32)
-        BUFFER_ROWS = chunk_size * 8
+        BUFFER_ROWS = chunk_size
         hit_buffer = np.empty((BUFFER_ROWS, *HIT_SHAPE), dtype=np.float32)
         scalar_buffers = {
             n: np.empty((BUFFER_ROWS, 1), dtype=np.float32) for n in scalar_branches
@@ -193,43 +189,38 @@ def main(args):
             write_head = 0
             buf_fill = 0
 
-            # iterate valid entries in contiguous slices
-            slice_starts = range(0, nGood, BUFFER_ROWS)
-            for slice_start in slice_starts:
-                slice_end = min(slice_start + BUFFER_ROWS, nGood)
-                sel = valid_indices[slice_start:slice_end]
-                entry_start = int(sel[0])
-                entry_stop = int(sel[-1]) + 1
-
-                arrays = tree.arrays(
+            for arrays in tree.iterate(
                     branches_needed,
-                    entry_start=entry_start,
-                    entry_stop=entry_stop,
+                    step_size=BUFFER_ROWS,               # 32 events per chunk
                     library="np",
-                )
+                    decompression_executor=TrivialExecutor(),  # single-threaded decompression
+                ):
+                m0 = arrays["A_diphoton_gen_m0"]
+                good_mask = np.fromiter((len(x) > 0 for x in m0), dtype=bool)
+                if not good_mask.any():
+                    continue
+                # narrow arrays to selected events only
+                for k in arrays:
+                    arrays[k] = arrays[k][good_mask]
 
-                local_idx = sel - entry_start  # map global to local indices
-                for idx_in_slice, global_ev in enumerate(sel):
-                    li = local_idx[idx_in_slice]
+                for li in range(len(arrays["ECAL_energy"])):
                     if (write_head + buf_fill) % 100 == 0:
                         print(
                             f" .. processing {write_head + buf_fill}/{nGood} "
-                            f"(tree idx {global_ev})"
                         )
 
                     hit_matrix.fill(-np.inf)
 
                     # ECAL energy
                     ecal_energy = arrays["ECAL_energy"][li]
-                    compress_channel(
+                    if compress_channel(
                         ecal_energy,
                         ECAL_etaphi,
                         hit_matrix[:, 30, :],
-                        k=1500,
-                        thresh=1e-4,
-                    ) and overflow_counter.__setitem__(
-                        30, overflow_counter[30] + 1
-                    )
+                        k=8192,
+                        thresh=1e-10,
+                    ):
+                        overflow_counter[30] += 1
 
                     # HBHE energy
                     hbhe_energy = arrays["HBHE_energy"][li]
@@ -237,31 +228,33 @@ def main(args):
                         hbhe_energy,
                         HCAL_etaphi,
                         hit_matrix[:, 31, :],
+                        k=8192,
+                        thresh=1e-10,
                     ):
                         overflow_counter[31] += 1
 
-                    # high‑res hits
+                    # high-res hits
                     for ch, branch in enumerate(HIGHRES_BRANCHES):
                         triplet_np = arrays[branch][li]
                         triplet_reshaped = triplet_np.reshape(-1, 3)
-                        if compress_highres(triplet_reshaped, hit_matrix[:, ch, 0]):
+                        if compress_highres(triplet_reshaped, hit_matrix[:, ch, 0], thresh=1e-10):
                             overflow_counter[ch] += 1
 
                     # scalars
                     for name in scalar_branches:
                         scalar_buffers[name][buf_fill, 0] = arrays[name][li][0]
 
-                    hit_buffer[buf_fill, :, :, :] = hit_matrix
+                    hit_buffer[buf_fill] = hit_matrix
                     buf_fill += 1
 
-                # flush if full
-                if buf_fill == BUFFER_ROWS:
-                    slice_obj = slice(write_head, write_head + buf_fill)
-                    dsets["zero_suppressed_hit_collection"][slice_obj] = hit_buffer
-                    for n in scalar_branches:
-                        dsets[n][slice_obj] = scalar_buffers[n]
-                    write_head += buf_fill
-                    buf_fill = 0
+                    if buf_fill == BUFFER_ROWS:
+                        slice_ = slice(write_head, write_head + buf_fill)
+                        dsets["zero_suppressed_hit_collection"][slice_] = hit_buffer[:buf_fill]
+                        for n in scalar_branches:
+                            dsets[n][slice_] = scalar_buffers[n][:buf_fill]
+                        write_head += buf_fill
+                        buf_fill = 0
+                arrays.clear()
 
             # trailing rows
             if buf_fill:
@@ -276,10 +269,9 @@ def main(args):
         print(f" >> Wall time: {elapsed:.1f} minutes")
 
     print("========================================================")
-    print("=== Overflow summary (events with >1500 non‑zero hits) ===")
+    print("=== Overflow summary (events with >8192 non-zero hits) ===")
     channel_names = [
         "TrkPt",
-        "ECAL_E",
         "BPIX_L1",
         "BPIX_L2",
         "BPIX_L3",
@@ -309,6 +301,7 @@ def main(args):
         "TEC_L7",
         "TEC_L8",
         "TEC_L9",
+        "ECAL_E",
         "HBHE_E",
     ]
     for ch, cnt in enumerate(overflow_counter):
@@ -322,4 +315,5 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--decay", default="test")
     parser.add_argument("-n", "--idx", type=int, default=0)
     parser.add_argument("-c", "--chunk_size", type=int, default=32)
+    parser.add_argument("-m", "--mask_path", type=str, default=None)
     main(parser.parse_args())
