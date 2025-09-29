@@ -57,8 +57,6 @@ def main(args):
     # geometry constants
     HCAL_eta = np.linspace(-3, 3, 56, dtype=np.float32).reshape(56, 1)
     HCAL_phi = np.linspace(-np.pi, np.pi, 72, dtype=np.float32).reshape(1, 72)
-    HCAL_etaphi = np.stack(
-        (np.broadcast_to(HCAL_eta, (56, 72)), np.broadcast_to(HCAL_phi, (56, 72))),
         axis=-1,
     ).reshape(-1, 2)
 
@@ -115,12 +113,6 @@ def main(args):
         "TOB_layer3_triplets_atPV",
         "TOB_layer4_triplets_atPV",
         "TOB_layer5_triplets_atPV",
-        "TOB_layer6_triplets_atPV",
-        "TEC_layer1_triplets_atPV",
-        "TEC_layer2_triplets_atPV",
-        "TEC_layer3_triplets_atPV",
-        "TEC_layer4_triplets_atPV",
-        "TEC_layer5_triplets_atPV",
         "TEC_layer6_triplets_atPV",
         "TEC_layer7_triplets_atPV",
         "TEC_layer8_triplets_atPV",
@@ -142,6 +134,9 @@ def main(args):
         # pre-selection
         diphoton_m0 = tree["A_diphoton_gen_m0"].array(library="np")
         valid_mask = np.fromiter((len(x) > 0 for x in diphoton_m0), dtype=bool)
+        if args.mask_path is not None:
+            mask = np.load(args.mask_path).astype(bool)
+            valid_mask = np.logical_and(valid_mask, mask)
         valid_indices = np.nonzero(valid_mask)[0]
         nGood = valid_indices.size
         nEvts = tree.num_entries
@@ -254,9 +249,9 @@ def main(args):
 
                     if buf_fill == BUFFER_ROWS:
                         slice_ = slice(write_head, write_head + buf_fill)
-                        dsets["zero_suppressed_hit_collection"][slice_] = hit_buffer
+                        dsets["zero_suppressed_hit_collection"][slice_] = hit_buffer[:buf_fill]
                         for n in scalar_branches:
-                            dsets[n][slice_] = scalar_buffers[n]
+                            dsets[n][slice_] = scalar_buffers[n][:buf_fill]
                         write_head += buf_fill
                         buf_fill = 0
                 arrays.clear()
@@ -320,4 +315,5 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--decay", default="test")
     parser.add_argument("-n", "--idx", type=int, default=0)
     parser.add_argument("-c", "--chunk_size", type=int, default=32)
+    parser.add_argument("-m", "--mask_path", type=str, default=None)
     main(parser.parse_args())
