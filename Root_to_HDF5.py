@@ -53,10 +53,12 @@ def compress_highres(triplets, out, *, k=8192, thresh=1e-10, pad_val=-999.0):
 
 def main(args):
     chunk_size = args.chunk_size
-
+    
     # geometry constants
     HCAL_eta = np.linspace(-3, 3, 56, dtype=np.float32).reshape(56, 1)
     HCAL_phi = np.linspace(-np.pi, np.pi, 72, dtype=np.float32).reshape(1, 72)
+    HCAL_etaphi = np.stack(
+        (np.broadcast_to(HCAL_eta, (56, 72)), np.broadcast_to(HCAL_phi, (56, 72))),
         axis=-1,
     ).reshape(-1, 2)
 
@@ -113,6 +115,12 @@ def main(args):
         "TOB_layer3_triplets_atPV",
         "TOB_layer4_triplets_atPV",
         "TOB_layer5_triplets_atPV",
+        "TOB_layer6_triplets_atPV",
+        "TEC_layer1_triplets_atPV",
+        "TEC_layer2_triplets_atPV",
+        "TEC_layer3_triplets_atPV",
+        "TEC_layer4_triplets_atPV",
+        "TEC_layer5_triplets_atPV",
         "TEC_layer6_triplets_atPV",
         "TEC_layer7_triplets_atPV",
         "TEC_layer8_triplets_atPV",
