@@ -2,6 +2,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
+import re
 
 import h5py
 import numpy as np
@@ -51,9 +52,20 @@ def compress_highres(triplets, out, *, k=8192, thresh=1e-10, pad_val=-999.0):
     return overflow
 
 
+def _natural_key(p: Path):
+    # Sort like 1,2,10 instead of 1,10,2
+    parts = re.split(r'(\d+)', p.name)
+    return [int(x) if x.isdigit() else x.lower() for x in parts]
+
+
+def _sorted_files_in_dir(d: Path, suffix: str):
+    return sorted([p for p in d.iterdir() if p.is_file() and p.suffix == suffix], key=_natural_key)
+
+
 def main(args):
     chunk_size = args.chunk_size
-    
+    base_idx = args.idx
+
     # geometry constants
     HCAL_eta = np.linspace(-3, 3, 56, dtype=np.float32).reshape(56, 1)
     HCAL_phi = np.linspace(-np.pi, np.pi, 72, dtype=np.float32).reshape(1, 72)
@@ -130,198 +142,250 @@ def main(args):
     extra_branches = ["ECAL_energy", "HBHE_energy"]
     branches_needed = scalar_branches + HIGHRES_BRANCHES + extra_branches
 
-    file_path = Path(args.infile)
-    if not file_path.exists():
+    in_path = Path(args.infile)
+    if not in_path.exists():
         sys.exit(f"[error] Could not open {args.infile}")
 
-    print(f" >> Input file:  {args.infile}")
+    # Build file lists
+    if in_path.is_dir():
+        root_files = _sorted_files_in_dir(in_path, ".root")
+        if not root_files:
+            sys.exit(f"[error] No .root files in {in_path}")
+    else:
+        root_files = [in_path]
 
-    with uproot.open(args.infile, basketcache="0 B") as f:
-        tree = f["fevt/RHTree"]
+    # Build mask list
+    mask_list = [None] * len(root_files)
+    if args.mask_path is not None:
+        mpath = Path(args.mask_path)
+        if mpath.is_dir():
+            masks = _sorted_files_in_dir(mpath, ".npy")
+            if len(masks) != len(root_files):
+                sys.exit(f"[error] mask count ({len(masks)}) != file count ({len(root_files)})")
+            mask_list = masks
+        else:
+            if len(root_files) != 1:
+                sys.exit("[error] Single mask file provided but multiple ROOT files detected")
+            mask_list = [mpath]
 
-        # pre-selection
-        diphoton_m0 = tree["A_diphoton_gen_m0"].array(library="np")
-        valid_mask = np.fromiter((len(x) > 0 for x in diphoton_m0), dtype=bool)
-        if args.mask_path is not None:
-            mask = np.load(args.mask_path).astype(bool)
-            valid_mask = np.logical_and(valid_mask, mask)
-        valid_indices = np.nonzero(valid_mask)[0]
-        nGood = valid_indices.size
-        nEvts = tree.num_entries
-        if nGood == 0:
-            sys.exit("[error] No events survived pre-selection.")
-        print(
-            f" >> nEvts: {nEvts}\n >> {nGood}/{nEvts} events "
-            f"({100 * nGood / nEvts:.1f} %) after pre-selection"
-        )
+    print(f" >> Inputs: {len(root_files)} file(s)")
+    for i, p in enumerate(root_files):
+        print(f"    [{i}] {p}")
 
-        # shapes
-        HIT_SHAPE = (8192, 32, 3)
-        SCALAR_SHAPE = (1,)
+    # Pre-count pass to size HDF5
+    total_good = 0
+    per_file_good = []
+    per_file_nev = []
 
-        out_path = f"{args.outdir}/{args.decay}_{args.idx}.h5"
-        print(f" >> Output file: {out_path}")
+    for fi, rf in enumerate(root_files):
+        with uproot.open(rf, basketcache="0 B") as f:
+            tree = f["fevt/RHTree"]
+            nEvts = tree.num_entries
+            per_file_nev.append(nEvts)
 
-        overflow_counter = np.zeros(32, dtype=np.int64)
+            # optional mask
+            msk = None
+            if mask_list[fi] is not None:
+                msk = np.load(mask_list[fi]).astype(bool)
+                if msk.shape[0] != nEvts:
+                    sys.exit(f"[error] mask length {msk.shape[0]} != nEvts {nEvts} for {mask_list[fi]}")
 
-        hit_matrix = np.empty(HIT_SHAPE, dtype=np.float32)
-        BUFFER_ROWS = chunk_size
-        hit_buffer = np.empty((BUFFER_ROWS, *HIT_SHAPE), dtype=np.float32)
-        scalar_buffers = {
-            n: np.empty((BUFFER_ROWS, 1), dtype=np.float32) for n in scalar_branches
-        }
-
-        start_time = time.time()
-
-        with h5py.File(out_path, "w") as proper_data:
-            dsets = {}
-            for name in scalar_branches + ["zero_suppressed_hit_collection"]:
-                shape = (
-                    (nGood, *HIT_SHAPE)
-                    if name == "zero_suppressed_hit_collection"
-                    else (nGood, *SCALAR_SHAPE)
-                )
-                chunks = (
-                    (chunk_size, *HIT_SHAPE)
-                    if name == "zero_suppressed_hit_collection"
-                    else (chunk_size, *SCALAR_SHAPE)
-                )
-                dsets[name] = proper_data.create_dataset(
-                    name,
-                    shape=shape,
-                    dtype="float32",
-                    compression="lzf",
-                    chunks=chunks,
-                )
-
-            write_head = 0
-            buf_fill = 0
-
+            n_good = 0
+            offset = 0
             for arrays in tree.iterate(
-                    branches_needed,
-                    step_size=BUFFER_ROWS,               # 32 events per chunk
-                    library="np",
-                    decompression_executor=TrivialExecutor(),  # single-threaded decompression
-                ):
+                ["A_diphoton_gen_m0"],
+                step_size=args.chunk_size,
+                library="np",
+                decompression_executor=TrivialExecutor(),
+            ):
                 m0 = arrays["A_diphoton_gen_m0"]
-                good_mask = np.fromiter((len(x) > 0 for x in m0), dtype=bool)
-                if not good_mask.any():
-                    continue
-                # narrow arrays to selected events only
-                for k in arrays:
-                    arrays[k] = arrays[k][good_mask]
-
-                for li in range(len(arrays["ECAL_energy"])):
-                    if (write_head + buf_fill) % 100 == 0:
-                        print(
-                            f" .. processing {write_head + buf_fill}/{nGood} "
-                        )
-
-                    hit_matrix.fill(-np.inf)
-
-                    # ECAL energy
-                    ecal_energy = arrays["ECAL_energy"][li]
-                    if compress_channel(
-                        ecal_energy,
-                        ECAL_etaphi,
-                        hit_matrix[:, 30, :],
-                        k=8192,
-                        thresh=1e-10,
-                    ):
-                        overflow_counter[30] += 1
-
-                    # HBHE energy
-                    hbhe_energy = arrays["HBHE_energy"][li]
-                    if compress_channel(
-                        hbhe_energy,
-                        HCAL_etaphi,
-                        hit_matrix[:, 31, :],
-                        k=8192,
-                        thresh=1e-10,
-                    ):
-                        overflow_counter[31] += 1
-
-                    # high-res hits
-                    for ch, branch in enumerate(HIGHRES_BRANCHES):
-                        triplet_np = arrays[branch][li]
-                        triplet_reshaped = triplet_np.reshape(-1, 3)
-                        if compress_highres(triplet_reshaped, hit_matrix[:, ch, 0], thresh=1e-10):
-                            overflow_counter[ch] += 1
-
-                    # scalars
-                    for name in scalar_branches:
-                        scalar_buffers[name][buf_fill, 0] = arrays[name][li][0]
-
-                    hit_buffer[buf_fill] = hit_matrix
-                    buf_fill += 1
-
-                    if buf_fill == BUFFER_ROWS:
-                        slice_ = slice(write_head, write_head + buf_fill)
-                        dsets["zero_suppressed_hit_collection"][slice_] = hit_buffer[:buf_fill]
-                        for n in scalar_branches:
-                            dsets[n][slice_] = scalar_buffers[n][:buf_fill]
-                        write_head += buf_fill
-                        buf_fill = 0
+                cl = len(m0)
+                good = np.fromiter((len(x) > 0 for x in m0), dtype=bool)
+                if msk is not None:
+                    good &= msk[offset:offset + cl]
+                n_good += int(good.sum())
+                offset += cl
                 arrays.clear()
 
-            # trailing rows
-            if buf_fill:
-                slice_obj = slice(write_head, write_head + buf_fill)
-                dsets["zero_suppressed_hit_collection"][slice_obj] = hit_buffer[:buf_fill]
-                for n in scalar_branches:
-                    dsets[n][slice_obj] = scalar_buffers[n][:buf_fill]
-                write_head += buf_fill
-            assert write_head == nGood
+            per_file_good.append(n_good)
+            total_good += n_good
 
-        elapsed = (time.time() - start_time) / 60.0
-        print(f" >> Wall time: {elapsed:.1f} minutes")
+        print(f" >> {rf.name}: nEvts={nEvts}  nGood={n_good} ({0 if nEvts==0 else 100*n_good/nEvts:.1f} %)")
 
-    print("========================================================")
-    print("=== Overflow summary (events with >8192 non-zero hits) ===")
+    if total_good == 0:
+        sys.exit("[error] No events survived pre-selection across all inputs.")
+
+    # shapes
+    HIT_SHAPE = (8192, 32, 3)
+    SCALAR_SHAPE = (1,)
+
+    # Output name
+    if in_path.is_dir():
+        out_path = f"{args.outdir}/{args.decay}_merged.h5"
+    else:
+        out_path = f"{args.outdir}/{args.decay}_{args.idx}.h5"
+
+    print(f" >> Output file: {out_path}")
+
+    overflow_counter = np.zeros(32, dtype=np.int64)
+    hit_matrix = np.empty(HIT_SHAPE, dtype=np.float32)
+    BUFFER_ROWS = chunk_size
+    hit_buffer = np.empty((BUFFER_ROWS, *HIT_SHAPE), dtype=np.float32)
+    scalar_buffers = {n: np.empty((BUFFER_ROWS, 1), dtype=np.float32) for n in scalar_branches}
+    file_index_buffer = np.empty((BUFFER_ROWS, 1), dtype=np.int32)
+
+    start_time = time.time()
+
+    with h5py.File(out_path, "w") as proper_data:
+        dsets = {}
+
+        # Create datasets
+        dsets["zero_suppressed_hit_collection"] = proper_data.create_dataset(
+            "zero_suppressed_hit_collection",
+            shape=(total_good, *HIT_SHAPE),
+            dtype="float32",
+            compression="lzf",
+            chunks=(chunk_size, *HIT_SHAPE),
+        )
+        for name in scalar_branches:
+            dsets[name] = proper_data.create_dataset(
+                name,
+                shape=(total_good, *SCALAR_SHAPE),
+                dtype="float32",
+                compression="lzf",
+                chunks=(chunk_size, *SCALAR_SHAPE),
+            )
+        # per‑event file index
+        dsets["file_index"] = proper_data.create_dataset(
+            "file_index",
+            shape=(total_good, *SCALAR_SHAPE),
+            dtype="int32",
+            compression="lzf",
+            chunks=(chunk_size, *SCALAR_SHAPE),
+        )
+
+        write_head = 0
+        buf_fill = 0
+
+        # Second pass: fill
+        for fi, rf in enumerate(root_files):
+            file_idx_value = base_idx + fi
+            with uproot.open(rf, basketcache="0 B") as f:
+                tree = f["fevt/RHTree"]
+
+                # file mask
+                msk = None
+                if mask_list[fi] is not None:
+                    msk = np.load(mask_list[fi]).astype(bool)
+
+                offset = 0
+                for arrays in tree.iterate(
+                    branches_needed,
+                    step_size=BUFFER_ROWS,
+                    library="np",
+                    decompression_executor=TrivialExecutor(),
+                ):
+                    m0 = arrays["A_diphoton_gen_m0"]
+                    cl = len(m0)
+
+                    good_mask = np.fromiter((len(x) > 0 for x in m0), dtype=bool)
+                    if msk is not None:
+                        good_mask &= msk[offset:offset + cl]
+
+                    offset += cl
+                    if not good_mask.any():
+                        arrays.clear()
+                        continue
+
+                    # narrow arrays to selected events only
+                    for k in arrays:
+                        arrays[k] = arrays[k][good_mask]
+
+                    for li in range(len(arrays["ECAL_energy"])):
+                        if (write_head + buf_fill) % 100 == 0:
+                            print(f" .. processing {write_head + buf_fill}/{total_good}")
+
+                        hit_matrix.fill(-np.inf)
+
+                        # ECAL energy
+                        ecal_energy = arrays["ECAL_energy"][li]
+                        if compress_channel(
+                            ecal_energy, ECAL_etaphi, hit_matrix[:, 30, :], k=8192, thresh=1e-10
+                        ):
+                            overflow_counter[30] += 1
+
+                        # HBHE energy
+                        hbhe_energy = arrays["HBHE_energy"][li]
+                        if compress_channel(
+                            hbhe_energy, HCAL_etaphi, hit_matrix[:, 31, :], k=8192, thresh=1e-10
+                        ):
+                            overflow_counter[31] += 1
+
+                        # high-res hits
+                        for ch, branch in enumerate(HIGHRES_BRANCHES):
+                            triplet_np = arrays[branch][li]
+                            triplet_reshaped = triplet_np.reshape(-1, 3)
+                            if compress_highres(triplet_reshaped, hit_matrix[:, ch, 0], thresh=1e-10):
+                                overflow_counter[ch] += 1
+
+                        # scalars
+                        for name in scalar_branches:
+                            scalar_buffers[name][buf_fill, 0] = arrays[name][li][0]
+
+                        # file index
+                        file_index_buffer[buf_fill, 0] = file_idx_value
+
+                        hit_buffer[buf_fill] = hit_matrix
+                        buf_fill += 1
+
+                        if buf_fill == BUFFER_ROWS:
+                            sl = slice(write_head, write_head + buf_fill)
+                            dsets["zero_suppressed_hit_collection"][sl] = hit_buffer[:buf_fill]
+                            for n in scalar_branches:
+                                dsets[n][sl] = scalar_buffers[n][:buf_fill]
+                            dsets["file_index"][sl] = file_index_buffer[:buf_fill]
+                            write_head += buf_fill
+                            buf_fill = 0
+
+                    arrays.clear()
+
+        # trailing rows
+        if buf_fill:
+            sl = slice(write_head, write_head + buf_fill)
+            dsets["zero_suppressed_hit_collection"][sl] = hit_buffer[:buf_fill]
+            for n in scalar_branches:
+                dsets[n][sl] = scalar_buffers[n][:buf_fill]
+            dsets["file_index"][sl] = file_index_buffer[:buf_fill]
+            write_head += buf_fill
+
+        assert write_head == total_good
+
+    elapsed = (time.time() - start_time) / 60.0
+    print(f" >> Wall time: {elapsed:.1f} minutes")
+
+    print("Overflow summary (events with >8192 non-zero hits)")
     channel_names = [
-        "TrkPt",
-        "BPIX_L1",
-        "BPIX_L2",
-        "BPIX_L3",
-        "BPIX_L4",
-        "FPIX_L1",
-        "FPIX_L2",
-        "FPIX_L3",
-        "TIB_L1",
-        "TIB_L2",
-        "TIB_L3",
-        "TIB_L4",
-        "TID_L1",
-        "TID_L2",
-        "TID_L3",
-        "TOB_L1",
-        "TOB_L2",
-        "TOB_L3",
-        "TOB_L4",
-        "TOB_L5",
-        "TOB_L6",
-        "TEC_L1",
-        "TEC_L2",
-        "TEC_L3",
-        "TEC_L4",
-        "TEC_L5",
-        "TEC_L6",
-        "TEC_L7",
-        "TEC_L8",
-        "TEC_L9",
-        "ECAL_E",
-        "HBHE_E",
+        "TrkPt","BPIX_L1","BPIX_L2","BPIX_L3","BPIX_L4",
+        "FPIX_L1","FPIX_L2","FPIX_L3",
+        "TIB_L1","TIB_L2","TIB_L3","TIB_L4",
+        "TID_L1","TID_L2","TID_L3",
+        "TOB_L1","TOB_L2","TOB_L3","TOB_L4","TOB_L5","TOB_L6",
+        "TEC_L1","TEC_L2","TEC_L3","TEC_L4","TEC_L5","TEC_L6","TEC_L7","TEC_L8","TEC_L9",
+        "ECAL_E","HBHE_E",
     ]
     for ch, cnt in enumerate(overflow_counter):
         print(f"{channel_names[ch]:>8s}: {cnt}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ROOT -> HDF5 converter (uproot)")
-    parser.add_argument("-i", "--infile", default="output_qqgg.root")
+    parser = argparse.ArgumentParser(description="ROOT -> HDF5 converter (uproot), single file or directory")
+    parser.add_argument("-i", "--infile", default="output_qqgg.root",
+                        help="ROOT file or a directory containing .root files")
     parser.add_argument("-o", "--outdir", default=".")
     parser.add_argument("-d", "--decay", default="test")
-    parser.add_argument("-n", "--idx", type=int, default=0)
+    parser.add_argument("-n", "--idx", type=int, default=0,
+                        help="Base index added to per-file file_index (base_idx + file_number)")
     parser.add_argument("-c", "--chunk_size", type=int, default=32)
-    parser.add_argument("-m", "--mask_path", type=str, default=None)
+    parser.add_argument("-m", "--mask_path", type=str, default=None,
+                        help="Optional .npy mask file or a directory of .npy masks (sorted to match inputs)")
     main(parser.parse_args())
