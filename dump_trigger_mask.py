@@ -2,6 +2,7 @@ import argparse
 import re
 import fnmatch
 import numpy as np
+from typing import Optional
 import ROOT
 from pathlib import Path
 
@@ -53,7 +54,7 @@ def _hlt_version(name: str) -> int:
     return int(m.group(1)) if m else -1
 
 
-def _best_match(all_names: list[str], pattern: str) -> str | None:
+def _best_match(all_names: list[str], pattern: str) -> Optional[str]:
     """
     Choose the best HLT name matching 'pattern'.
     Supports:
