@@ -1,5 +1,6 @@
 import argparse
 import re
+import fnmatch
 import numpy as np
 import ROOT
 from pathlib import Path
@@ -46,24 +47,88 @@ def compute_pass_rates(fname: str) -> list[tuple[str, float, int, int]]:
     return sorted(stats, key=lambda x: x[1], reverse=True)
 
 
+def _hlt_version(name: str) -> int:
+    """Extract trailing _vN version as integer; -1 if missing."""
+    m = re.search(r'_v(\d+)$', name)
+    return int(m.group(1)) if m else -1
+
+
+def _best_match(all_names: list[str], pattern: str) -> str | None:
+    """
+    Choose the best HLT name matching 'pattern'.
+    Supports:
+      - exact names: HLT_XYZ_v12
+      - prefix '..._v' (treated as '..._v*')
+      - glob wildcards: '*' and '?'
+      - fallback: startswith(pattern) if no glob given and no exact match
+    Prefers the highest _vN version among matches.
+    """
+    pat = pattern.strip()
+
+    # exact short-circuit
+    if pat in all_names:
+        return pat
+
+    # expand common prefix form
+    if ('*' not in pat) and ('?' not in pat) and pat.endswith('v'):
+        pat = pat + '*'
+    if ('*' not in pat) and ('?' not in pat) and pat.endswith('_v'):
+        pat = pat + '*'
+
+    # glob match
+    cands = [n for n in all_names if fnmatch.fnmatch(n, pat)]
+    if not cands and ('*' not in pattern) and ('?' not in pattern):
+        cands = [n for n in all_names if n.startswith(pattern)]
+
+    if not cands:
+        return None
+
+    # pick highest version, break ties by natural key
+    def _key(s: str):
+        return (_hlt_version(s), _natural_key(s))
+    return sorted(cands, key=_key)[-1]
+
+
 def save_mask(fname: str, hlt_path: str, outname: str) -> None:
-    """Build & save a boolean mask for one trigger path in one file."""
+    """
+    Build & save a boolean mask for one trigger path in one file.
+    'hlt_path' can be:
+      - exact: HLT_IsoMu24_v12
+      - prefix: HLT_IsoMu24_v
+      - glob:   HLT_IsoMu24_v*
+    Matching is resolved per event to handle menu version changes.
+    """
     evs     = Events(fname)
     trg_h   = Handle("edm::TriggerResults")
     trg_tag = ("TriggerResults", "", "HLT")
     mask    = np.zeros(evs.size(), dtype=bool)
 
+    resolved_names: list[str] = []  # optional diagnostics
+
     for ievt, ev in enumerate(evs):
         ev.getByLabel(trg_tag, trg_h)
         trg   = trg_h.product()
         names = ev.object().triggerNames(trg)
-        idx   = names.triggerIndex(hlt_path)
+        # cache names list for this event
+        all_names = [names.triggerName(i) for i in range(names.size())]
+
+        chosen = _best_match(all_names, hlt_path)
+        if chosen is None:
+            # no match this event
+            mask[ievt] = False
+            resolved_names.append("")  # keep alignment
+            continue
+
+        idx = names.triggerIndex(chosen)
         if idx < trg.size():
             mask[ievt] = trg.accept(idx)
+        else:
+            mask[ievt] = False
+        resolved_names.append(chosen)
 
     np.save(outname, mask)
-    print(f"[+] {outname} written: {mask.sum()}/{mask.size} passed '{hlt_path}'")
-
+    n_pass = int(mask.sum())
+    print(f"[+] {outname} written: {n_pass}/{mask.size} passed for pattern '{hlt_path}'")
 
 def _natural_key(s: str):
     """Natural sort key: splits digits so file_2 < file_10."""
@@ -86,6 +151,32 @@ def process_dir(indir: Path, hlt_path: str, outdir: Path, glob: str) -> None:
         save_mask(str(f), hlt_path, str(out))
 
 
+def _read_path_file(path_file: Path) -> list[str]:
+    """
+    Load trigger list file.
+    One pattern per line. Lines starting with '#' ignored. Blank lines ignored.
+    """
+    paths: list[str] = []
+    with open(path_file, 'r') as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            # support inline comments
+            if '#' in line:
+                line = line.split('#', 1)[0].strip()
+            if line:
+                paths.append(line)
+    # dedupe preserving order
+    seen = set()
+    uniq = []
+    for p in paths:
+        if p not in seen:
+            uniq.append(p)
+            seen.add(p)
+    return uniq
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="FWLite helper: list HLT_ paths by pass rate or dump trigger masks "
@@ -96,18 +187,20 @@ if __name__ == "__main__":
     group.add_argument("-a", "--all", action="store_true",
                        help="Dump masks for all HLT_ triggers into separate .npy files (single file input)")
     group.add_argument("-t", "--hlt_path", nargs="?",
-                       help="Single HLT_ path name (e.g. HLT_IsoMu24_v). If -i is a directory, this is applied to every file in it.")
-    
+                       help="Single HLT path. Accepts exact (HLT_X_v12), prefix (HLT_X_v), or glob (HLT_X_v*). If -i is a directory, apply to every file.")
+    group.add_argument("-f", "--path_file", nargs="?",
+                       help="Text file with HLT paths/patterns (one per line, '#' comments supported). If -i is a directory, apply each entry to every file.")
+
     parser.add_argument("-i", "--input", required=True,
                         help="input EDM/ROOT file OR directory")
     parser.add_argument("-o", "--output", nargs="?",
                         help="single-file: output .npy for the mask; directory: output folder for masks (default: <indir>/masks_<hlt>)")
     parser.add_argument("--glob", default="*.root",
                         help="when -i is a directory, glob to pick files (default: *.root)")
-    
+
     args = parser.parse_args()
     inp = Path(args.input)
-    
+
     if args.list:
         # If a directory is provided, use the first matching file for discovery.
         if inp.is_dir():
@@ -130,10 +223,10 @@ if __name__ == "__main__":
                     print(f"{path}: {passed}/{total} = {rate:.2%}")
             else:
                 print(f"{inp}: no HLT_ TriggerResults found")
-    
+
     elif args.all:
         if inp.is_dir():
-            print("Directory + --all is not supported. Use -t/--hlt_path for per-file masks in a directory.")
+            print("Directory + --all is not supported. Use -t/--hlt_path or -f/--path_file for per-file masks in a directory.")
         else:
             stats = compute_pass_rates(str(inp))
             if not stats:
@@ -143,7 +236,29 @@ if __name__ == "__main__":
                     stem = Path(path).stem
                     out  = f"{stem}_mask.npy"
                     save_mask(str(inp), path, out)
-    
+
+    elif args.path_file:
+        path_list = _read_path_file(Path(args.path_file))
+        if not path_list:
+            raise SystemExit(f"{args.path_file}: no valid HLT entries found")
+
+        if inp.is_dir():
+            # Base output dir: user-provided dir or per-path default under input dir
+            base_out = Path(args.output) if args.output else inp
+            for pat in path_list:
+                hlt_stem = Path(pat).stem
+                outdir = base_out / (f"masks_{hlt_stem}" if base_out == inp else hlt_stem)
+                process_dir(inp, pat, outdir, args.glob)
+        else:
+            # Single input file. If -o is given, treat it as an output directory.
+            outdir = Path(args.output) if args.output else None
+            if outdir:
+                outdir.mkdir(parents=True, exist_ok=True)
+            for pat in path_list:
+                stem = Path(pat).stem
+                out  = (outdir / f"{stem}_mask.npy") if outdir else Path(f"{stem}_mask.npy")
+                save_mask(str(inp), pat, str(out))
+
     else:
         # single-path mask mode
         if not args.hlt_path:
